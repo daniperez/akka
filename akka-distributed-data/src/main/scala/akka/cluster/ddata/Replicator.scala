@@ -5,15 +5,18 @@
 package akka.cluster.ddata
 
 import java.security.MessageDigest
+
 import scala.collection.immutable
 import scala.collection.mutable
 import scala.concurrent.duration._
 import scala.concurrent.duration.FiniteDuration
 import java.util.concurrent.ThreadLocalRandom
+
 import scala.util.Failure
 import scala.util.Success
 import scala.util.Try
 import scala.util.control.NoStackTrace
+
 import akka.actor.Actor
 import akka.actor.ActorLogging
 import akka.actor.ActorRef
@@ -34,24 +37,31 @@ import akka.serialization.SerializationExtension
 import akka.util.ByteString
 import com.typesafe.config.Config
 import java.util.function.{ Function => JFunction }
+
 import akka.dispatch.Dispatchers
 import akka.actor.DeadLetterSuppression
 import akka.cluster.ddata.Key.KeyR
 import java.util.Optional
+
 import akka.cluster.ddata.DurableStore._
 import akka.actor.ExtendedActorSystem
 import akka.actor.SupervisorStrategy
 import akka.actor.OneForOneStrategy
 import akka.actor.ActorInitializationException
 import java.util.concurrent.TimeUnit
+
 import akka.util.Helpers.toRootLowerCase
 import akka.actor.Cancellable
 import scala.util.control.NonFatal
+
 import akka.cluster.ddata.Key.KeyId
 import akka.annotation.InternalApi
 import scala.collection.immutable.TreeSet
+
 import akka.cluster.MemberStatus
 import scala.annotation.varargs
+
+import akka.event.Logging
 import akka.util.JavaDurationConverters._
 import akka.util.ccompat._
 
@@ -772,10 +782,16 @@ object Replicator {
     case object DeltaPropagationTick
     case object RemovedNodePruningTick
     case object ClockTick
-    final case class Write(key: KeyId, envelope: DataEnvelope) extends ReplicatorMessage
+    trait DestinationSystemUid {
+      // FIXME we can change from Option to Long after supporting mixed rolling updates for some versions
+      def toSystemUid: Option[Long]
+    }
+    final case class Write(key: KeyId, envelope: DataEnvelope, toSystemUid: Option[Long])
+        extends ReplicatorMessage
+        with DestinationSystemUid
     case object WriteAck extends ReplicatorMessage with DeadLetterSuppression
     case object WriteNack extends ReplicatorMessage with DeadLetterSuppression
-    final case class Read(key: KeyId) extends ReplicatorMessage
+    final case class Read(key: KeyId, toSystemUid: Option[Long]) extends ReplicatorMessage with DestinationSystemUid
     final case class ReadResult(envelope: Option[DataEnvelope]) extends ReplicatorMessage with DeadLetterSuppression
     final case class ReadRepair(key: KeyId, envelope: DataEnvelope)
     case object ReadRepairAck
@@ -924,7 +940,13 @@ object Replicator {
       override def merge(that: ReplicatedData): ReplicatedData = DeletedData
     }
 
-    final case class Status(digests: Map[KeyId, Digest], chunk: Int, totChunks: Int) extends ReplicatorMessage {
+    final case class Status(digests: Map[KeyId, Digest],
+                            chunk: Int,
+                            totChunks: Int,
+                            toSystemUid: Option[Long],
+                            fromSystemUid: Option[Long])
+        extends ReplicatorMessage
+        with DestinationSystemUid {
       override def toString: String =
         (digests
           .map {
@@ -932,11 +954,20 @@ object Replicator {
           })
           .mkString("Status(", ", ", ")")
     }
-    final case class Gossip(updatedData: Map[KeyId, DataEnvelope], sendBack: Boolean) extends ReplicatorMessage
+    final case class Gossip(updatedData: Map[KeyId, DataEnvelope],
+                            sendBack: Boolean,
+                            toSystemUid: Option[Long],
+                            fromSystemUid: Option[Long])
+        extends ReplicatorMessage
+        with DestinationSystemUid
 
     final case class Delta(dataEnvelope: DataEnvelope, fromSeqNr: Long, toSeqNr: Long)
-    final case class DeltaPropagation(fromNode: UniqueAddress, reply: Boolean, deltas: Map[KeyId, Delta])
+    final case class DeltaPropagation(fromNode: UniqueAddress,
+                                      reply: Boolean,
+                                      deltas: Map[KeyId, Delta],
+                                      toSystemUid: Option[Long])
         extends ReplicatorMessage
+        with DestinationSystemUid
     object DeltaPropagation {
 
       /**
@@ -1164,6 +1195,7 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
   val cluster = Cluster(context.system)
   val selfAddress = cluster.selfAddress
   val selfUniqueAddress = cluster.selfUniqueAddress
+  val selfFromSystemUid = Some(selfUniqueAddress.longUid)
 
   require(!cluster.isTerminated, "Cluster node must not be terminated")
   require(roles.subsetOf(cluster.selfRoles),
@@ -1200,14 +1232,15 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
 
   val deltaPropagationSelector = new DeltaPropagationSelector {
     override val gossipIntervalDivisor = 5
-    override def allNodes: Vector[Address] = {
+    override def allNodes: Vector[UniqueAddress] = {
       // TODO optimize, by maintaining a sorted instance variable instead
       nodes.union(weaklyUpNodes).diff(unreachable).toVector.sorted
     }
 
     override def maxDeltaSize: Int = settings.maxDeltaSize
 
-    override def createDeltaPropagation(deltas: Map[KeyId, (ReplicatedData, Long, Long)]): DeltaPropagation = {
+    override def createDeltaPropagation(deltas: Map[KeyId, (ReplicatedData, Long, Long)],
+                                        toSystemUid: Long): DeltaPropagation = {
       // Important to include the pruning state in the deltas. For example if the delta is based
       // on an entry that has been pruned but that has not yet been performed on the target node.
       DeltaPropagation(selfUniqueAddress,
@@ -1218,7 +1251,8 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
                              case Some(envelope) => key -> Delta(envelope.copy(data = d), fromSeqNr, toSeqNr)
                              case None           => key -> Delta(DataEnvelope(d), fromSeqNr, toSeqNr)
                            }
-                       }.toMap)
+                       }.toMap,
+                       Some(toSystemUid))
     }
   }
   val deltaPropagationTask: Option[Cancellable] =
@@ -1233,10 +1267,10 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
     } else None
 
   // cluster nodes, doesn't contain selfAddress
-  var nodes: Set[Address] = Set.empty
+  var nodes: Set[UniqueAddress] = Set.empty
 
   // cluster weaklyUp nodes, doesn't contain selfAddress
-  var weaklyUpNodes: Set[Address] = Set.empty
+  var weaklyUpNodes: Set[UniqueAddress] = Set.empty
 
   var removedNodes: Map[UniqueAddress, Long] = Map.empty
   // all nodes sorted with the leader first
@@ -1247,7 +1281,7 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
   // for pruning timeouts are based on clock that is only increased when all nodes are reachable
   var previousClockTime = System.nanoTime()
   var allReachableClockTime = 0L
-  var unreachable = Set.empty[Address]
+  var unreachable = Set.empty[UniqueAddress]
 
   // the actual data
   var dataEntries = Map.empty[KeyId, (DataEnvelope, Digest)]
@@ -1371,32 +1405,53 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
 
   // MUST use replyTo instead of sender() and forward from normalReceive, because of the stash in load
   val normalReceive: Receive = {
-    case Get(key, consistency, req)             => receiveGet(key, consistency, req)
-    case u @ Update(key, writeC, req)           => receiveUpdate(key, u.modify, writeC, req)
-    case Read(key)                              => receiveRead(key)
-    case Write(key, envelope)                   => receiveWrite(key, envelope)
-    case ReadRepair(key, envelope)              => receiveReadRepair(key, envelope)
-    case DeltaPropagation(from, reply, deltas)  => receiveDeltaPropagation(from, reply, deltas)
-    case FlushChanges                           => receiveFlushChanges()
-    case DeltaPropagationTick                   => receiveDeltaPropagationTick()
-    case GossipTick                             => receiveGossipTick()
-    case ClockTick                              => receiveClockTick()
-    case Status(otherDigests, chunk, totChunks) => receiveStatus(otherDigests, chunk, totChunks)
-    case Gossip(updatedData, sendBack)          => receiveGossip(updatedData, sendBack)
-    case Subscribe(key, subscriber)             => receiveSubscribe(key, subscriber)
-    case Unsubscribe(key, subscriber)           => receiveUnsubscribe(key, subscriber)
-    case Terminated(ref)                        => receiveTerminated(ref)
-    case MemberWeaklyUp(m)                      => receiveWeaklyUpMemberUp(m)
-    case MemberUp(m)                            => receiveMemberUp(m)
-    case MemberRemoved(m, _)                    => receiveMemberRemoved(m)
-    case evt: MemberEvent                       => receiveOtherMemberEvent(evt.member)
-    case UnreachableMember(m)                   => receiveUnreachable(m)
-    case ReachableMember(m)                     => receiveReachable(m)
-    case GetKeyIds                              => receiveGetKeyIds()
-    case Delete(key, consistency, req)          => receiveDelete(key, consistency, req)
-    case RemovedNodePruningTick                 => receiveRemovedNodePruningTick()
-    case GetReplicaCount                        => receiveGetReplicaCount()
-    case TestFullStateGossip(enabled)           => fullStateGossipEnabled = enabled
+    case msg: DestinationSystemUid =>
+      msg.toSystemUid match {
+        case Some(uid) if uid != selfUniqueAddress.longUid =>
+          // When restarting a node with same host:port it is possible that a Replicator on another node
+          // is sending messages to the restarted node even if it hasn't joined the same cluster.
+          // Therefore we check that the message was intended for this incarnation and otherwise
+          // it is discarded.
+          log.info("Ignoring message [{}] from [{}] intended for system uid [{}], self uid is [{}]",
+                   Logging.simpleName(msg),
+                   replyTo,
+                   uid,
+                   selfUniqueAddress.longUid)
+        case _ =>
+          msg match {
+            case Read(key, _)                             => receiveRead(key)
+            case Write(key, envelope, _)                  => receiveWrite(key, envelope)
+            case DeltaPropagation(from, reply, deltas, _) => receiveDeltaPropagation(from, reply, deltas)
+            case Status(otherDigests, chunk, totChunks, _, fromSystemUid) =>
+              receiveStatus(otherDigests, chunk, totChunks, fromSystemUid)
+            case Gossip(updatedData, sendBack, _, fromSystemUid) =>
+              receiveGossip(updatedData, sendBack, fromSystemUid)
+          }
+      }
+    case msg =>
+      msg match {
+        case Get(key, consistency, req)    => receiveGet(key, consistency, req)
+        case u @ Update(key, writeC, req)  => receiveUpdate(key, u.modify, writeC, req)
+        case ReadRepair(key, envelope)     => receiveReadRepair(key, envelope)
+        case FlushChanges                  => receiveFlushChanges()
+        case DeltaPropagationTick          => receiveDeltaPropagationTick()
+        case GossipTick                    => receiveGossipTick()
+        case ClockTick                     => receiveClockTick()
+        case Subscribe(key, subscriber)    => receiveSubscribe(key, subscriber)
+        case Unsubscribe(key, subscriber)  => receiveUnsubscribe(key, subscriber)
+        case Terminated(ref)               => receiveTerminated(ref)
+        case MemberWeaklyUp(m)             => receiveWeaklyUpMemberUp(m)
+        case MemberUp(m)                   => receiveMemberUp(m)
+        case MemberRemoved(m, _)           => receiveMemberRemoved(m)
+        case evt: MemberEvent              => receiveOtherMemberEvent(evt.member)
+        case UnreachableMember(m)          => receiveUnreachable(m)
+        case ReachableMember(m)            => receiveReachable(m)
+        case GetKeyIds                     => receiveGetKeyIds()
+        case Delete(key, consistency, req) => receiveDelete(key, consistency, req)
+        case RemovedNodePruningTick        => receiveRemovedNodePruningTick()
+        case GetReplicaCount               => receiveGetReplicaCount()
+        case TestFullStateGossip(enabled)  => fullStateGossipEnabled = enabled
+      }
   }
 
   def receiveGet(key: KeyR, consistency: ReadConsistency, req: Option[Any]): Unit = {
@@ -1781,10 +1836,15 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
       selectRandomNode(nodes.union(weaklyUpNodes).toVector).foreach(gossipTo)
   }
 
-  def gossipTo(address: Address): Unit = {
+  def gossipTo(address: UniqueAddress): Unit = {
     val to = replica(address)
+    val toSystemUid = Some(address.longUid)
     if (dataEntries.size <= maxDeltaElements) {
-      val status = Status(dataEntries.map { case (key, (_, _)) => (key, getDigest(key)) }, chunk = 0, totChunks = 1)
+      val status = Status(dataEntries.map { case (key, (_, _)) => (key, getDigest(key)) },
+                          chunk = 0,
+                          totChunks = 1,
+                          toSystemUid,
+                          selfFromSystemUid)
       to ! status
     } else {
       val totChunks = dataEntries.size / maxDeltaElements
@@ -1798,19 +1858,19 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
         val chunk = (statusCount % totChunks).toInt
         val status = Status(dataEntries.collect {
           case (key, (_, _)) if math.abs(key.hashCode % totChunks) == chunk => (key, getDigest(key))
-        }, chunk, totChunks)
+        }, chunk, totChunks, toSystemUid, selfFromSystemUid)
         to ! status
       }
     }
   }
 
-  def selectRandomNode(addresses: immutable.IndexedSeq[Address]): Option[Address] =
+  def selectRandomNode(addresses: immutable.IndexedSeq[UniqueAddress]): Option[UniqueAddress] =
     if (addresses.isEmpty) None else Some(addresses(ThreadLocalRandom.current.nextInt(addresses.size)))
 
-  def replica(address: Address): ActorSelection =
-    context.actorSelection(self.path.toStringWithAddress(address))
+  def replica(node: UniqueAddress): ActorSelection =
+    context.actorSelection(self.path.toStringWithAddress(node.address))
 
-  def receiveStatus(otherDigests: Map[KeyId, Digest], chunk: Int, totChunks: Int): Unit = {
+  def receiveStatus(otherDigests: Map[KeyId, Digest], chunk: Int, totChunks: Int, fromSystemUid: Option[Long]): Unit = {
     if (log.isDebugEnabled)
       log.debug("Received gossip status from [{}], chunk [{}] of [{}] containing [{}]",
                 replyTo.path.address,
@@ -1834,7 +1894,10 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
     if (keys.nonEmpty) {
       if (log.isDebugEnabled)
         log.debug("Sending gossip to [{}], containing [{}]", replyTo.path.address, keys.mkString(", "))
-      val g = Gossip(keys.iterator.map(k => k -> getData(k).get).toMap, sendBack = otherDifferentKeys.nonEmpty)
+      val g = Gossip(keys.iterator.map(k => k -> getData(k).get).toMap,
+                     sendBack = otherDifferentKeys.nonEmpty,
+                     fromSystemUid,
+                     selfFromSystemUid)
       replyTo ! g
     }
     val myMissingKeys = otherKeys.diff(myKeys)
@@ -1843,12 +1906,16 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
         log.debug("Sending gossip status to [{}], requesting missing [{}]",
                   replyTo.path.address,
                   myMissingKeys.mkString(", "))
-      val status = Status(myMissingKeys.iterator.map(k => k -> NotFoundDigest).toMap, chunk, totChunks)
+      val status = Status(myMissingKeys.iterator.map(k => k -> NotFoundDigest).toMap,
+                          chunk,
+                          totChunks,
+                          fromSystemUid,
+                          selfFromSystemUid)
       replyTo ! status
     }
   }
 
-  def receiveGossip(updatedData: Map[KeyId, DataEnvelope], sendBack: Boolean): Unit = {
+  def receiveGossip(updatedData: Map[KeyId, DataEnvelope], sendBack: Boolean, fromSystemUid: Option[Long]): Unit = {
     if (log.isDebugEnabled)
       log.debug("Received gossip from [{}], containing [{}]", replyTo.path.address, updatedData.keys.mkString(", "))
     var replyData = Map.empty[KeyId, DataEnvelope]
@@ -1864,7 +1931,7 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
         }
     }
     if (sendBack && replyData.nonEmpty)
-      replyTo ! Gossip(replyData, sendBack = false)
+      replyTo ! Gossip(replyData, sendBack = false, fromSystemUid, selfFromSystemUid)
   }
 
   def receiveSubscribe(key: KeyR, subscriber: ActorRef): Unit = {
@@ -1910,14 +1977,14 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
 
   def receiveWeaklyUpMemberUp(m: Member): Unit =
     if (matchingRole(m) && m.address != selfAddress)
-      weaklyUpNodes += m.address
+      weaklyUpNodes += m.uniqueAddress
 
   def receiveMemberUp(m: Member): Unit =
     if (matchingRole(m)) {
       leader += m
       if (m.address != selfAddress) {
-        nodes += m.address
-        weaklyUpNodes -= m.address
+        nodes += m.uniqueAddress
+        weaklyUpNodes -= m.uniqueAddress
       }
     }
 
@@ -1927,12 +1994,12 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
     else if (matchingRole(m)) {
       // filter, it's possible that the ordering is changed since it based on MemberStatus
       leader = leader.filterNot(_.uniqueAddress == m.uniqueAddress)
-      nodes -= m.address
-      weaklyUpNodes -= m.address
+      nodes -= m.uniqueAddress
+      weaklyUpNodes -= m.uniqueAddress
       log.debug("adding removed node [{}] from MemberRemoved", m.uniqueAddress)
       removedNodes = removedNodes.updated(m.uniqueAddress, allReachableClockTime)
-      unreachable -= m.address
-      deltaPropagationSelector.cleanupRemovedNode(m.address)
+      unreachable -= m.uniqueAddress
+      deltaPropagationSelector.cleanupRemovedNode(m.uniqueAddress)
     }
   }
 
@@ -1944,10 +2011,10 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
     }
 
   def receiveUnreachable(m: Member): Unit =
-    if (matchingRole(m)) unreachable += m.address
+    if (matchingRole(m)) unreachable += m.uniqueAddress
 
   def receiveReachable(m: Member): Unit =
-    if (matchingRole(m)) unreachable -= m.address
+    if (matchingRole(m)) unreachable -= m.uniqueAddress
 
   def receiveClockTick(): Unit = {
     val now = System.nanoTime()
@@ -1969,11 +2036,11 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
   }
 
   def collectRemovedNodes(): Unit = {
-    val knownNodes = nodes.union(weaklyUpNodes).union(removedNodes.keySet.map(_.address))
+    val knownNodes = nodes.union(weaklyUpNodes).union(removedNodes.keySet)
     val newRemovedNodes =
       dataEntries.foldLeft(Set.empty[UniqueAddress]) {
         case (acc, (_, (envelope @ DataEnvelope(data: RemovedNodePruning, _, _), _))) =>
-          acc.union(data.modifiedByNodes.filterNot(n => n == selfUniqueAddress || knownNodes(n.address)))
+          acc.union(data.modifiedByNodes.filterNot(n => n == selfUniqueAddress || knownNodes(n)))
         case (acc, _) =>
           acc
       }
@@ -2026,7 +2093,7 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
         pruning.foreach {
           case (removed, PruningInitialized(owner, seen))
               if owner == selfUniqueAddress
-              && (allNodes.isEmpty || allNodes.forall(seen)) =>
+              && (allNodes.isEmpty || allNodes.forall(n => seen(n.address))) =>
             val newEnvelope = envelope.prune(removed, if (isDurable(key)) durablePruningPerformed else pruningPerformed)
             log.debug("Perform pruning of [{}] from [{}] to [{}]", key, removed, selfUniqueAddress)
             setData(key, newEnvelope)
@@ -2089,22 +2156,23 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
   import ReadWriteAggregator._
 
   def timeout: FiniteDuration
-  def nodes: Set[Address]
-  def unreachable: Set[Address]
-  def reachableNodes: Set[Address] = nodes.diff(unreachable)
+  def nodes: Set[UniqueAddress]
+  def unreachable: Set[UniqueAddress]
+  def reachableNodes: Set[UniqueAddress] = nodes.diff(unreachable)
 
   import context.dispatcher
   var sendToSecondarySchedule = context.system.scheduler.scheduleOnce(timeout / 5, self, SendToSecondary)
   var timeoutSchedule = context.system.scheduler.scheduleOnce(timeout, self, ReceiveTimeout)
 
-  var remaining = nodes
+  var remaining = nodes.map(_.address)
 
   def doneWhenRemainingSize: Int
 
-  def primaryAndSecondaryNodes(requiresCausalDeliveryOfDeltas: Boolean): (Vector[Address], Vector[Address]) = {
+  def primaryAndSecondaryNodes(
+      requiresCausalDeliveryOfDeltas: Boolean): (Vector[UniqueAddress], Vector[UniqueAddress]) = {
     val primarySize = nodes.size - doneWhenRemainingSize
     if (primarySize >= nodes.size)
-      (nodes.toVector, Vector.empty[Address])
+      (nodes.toVector, Vector.empty[UniqueAddress])
     else {
       // Prefer to use reachable nodes over the unreachable nodes first.
       // When RequiresCausalDeliveryOfDeltas use deterministic order to so that sequence numbers of subsequent
@@ -2122,8 +2190,8 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
     timeoutSchedule.cancel()
   }
 
-  def replica(address: Address): ActorSelection =
-    context.actorSelection(context.parent.path.toStringWithAddress(address))
+  def replica(node: UniqueAddress): ActorSelection =
+    context.actorSelection(context.parent.path.toStringWithAddress(node.address))
 
 }
 
@@ -2136,8 +2204,8 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
             delta: Option[Replicator.Internal.Delta],
             consistency: Replicator.WriteConsistency,
             req: Option[Any],
-            nodes: Set[Address],
-            unreachable: Set[Address],
+            nodes: Set[UniqueAddress],
+            unreachable: Set[UniqueAddress],
             replyTo: ActorRef,
             durable: Boolean): Props =
     Props(new WriteAggregator(key, envelope, delta, consistency, req, nodes, unreachable, replyTo, durable))
@@ -2152,11 +2220,12 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
                                                  delta: Option[Replicator.Internal.Delta],
                                                  consistency: Replicator.WriteConsistency,
                                                  req: Option[Any],
-                                                 override val nodes: Set[Address],
-                                                 override val unreachable: Set[Address],
+                                                 override val nodes: Set[UniqueAddress],
+                                                 override val unreachable: Set[UniqueAddress],
                                                  replyTo: ActorRef,
                                                  durable: Boolean)
-    extends ReadWriteAggregator {
+    extends ReadWriteAggregator
+    with ActorLogging {
 
   import Replicator._
   import Replicator.Internal._
@@ -2177,10 +2246,12 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
       throw new IllegalArgumentException("WriteLocal not supported by WriteAggregator")
   }
 
-  val writeMsg = Write(key.id, envelope)
-  val deltaMsg = delta match {
+  def writeMsg(toSystemUid: Option[Long]) =
+    Write(key.id, envelope, toSystemUid)
+
+  def deltaMsg(toSystemUid: Option[Long]) = delta match {
     case None    => None
-    case Some(d) => Some(DeltaPropagation(selfUniqueAddress, reply = true, Map(key.id -> d)))
+    case Some(d) => Some(DeltaPropagation(selfUniqueAddress, reply = true, Map(key.id -> d), toSystemUid))
   }
 
   var gotLocalStoreReply = !durable
@@ -2195,11 +2266,15 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
   }
 
   override def preStart(): Unit = {
-    val msg = deltaMsg match {
-      case Some(d) => d
-      case None    => writeMsg
+
+    primaryNodes.foreach { to =>
+      val toSystemUid = Some(to.longUid)
+      val msg = deltaMsg(toSystemUid) match {
+        case Some(d) => d
+        case None    => writeMsg(toSystemUid)
+      }
+      replica(to) ! msg
     }
-    primaryNodes.foreach { replica(_) ! msg }
 
     if (isDone) reply(isTimeout = false)
   }
@@ -2215,7 +2290,14 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
       // Deltas must be applied in order and we can't keep track of ordering of
       // simultaneous updates so there is a chance that the delta could not be applied.
       // Try again with the full state
-      sender() ! writeMsg
+      val from = senderAddress()
+      nodes.find(_.address == from) match {
+        case Some(to) =>
+          sender() ! writeMsg(Some(to.longUid))
+        case None =>
+          // shouldn't happen
+          log.warning("Received DeltaNack from [{}], which is unknown", sender())
+      }
 
     case _: Replicator.UpdateSuccess[_] =>
       gotLocalStoreReply = true
@@ -2226,15 +2308,20 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
       if (isDone) reply(isTimeout = false)
 
     case SendToSecondary =>
-      deltaMsg match {
+      delta match {
         case None    =>
-        case Some(d) =>
+        case Some(_) =>
           // Deltas must be applied in order and we can't keep track of ordering of
           // simultaneous updates so there is a chance that the delta could not be applied.
           // Try again with the full state to the primary nodes that have not acked.
-          primaryNodes.toSet.intersect(remaining).foreach { replica(_) ! writeMsg }
+          primaryNodes.foreach { to =>
+            if (remaining(to.address))
+              replica(to) ! writeMsg(Some(to.longUid))
+          }
       }
-      secondaryNodes.foreach { replica(_) ! writeMsg }
+      secondaryNodes.foreach { to =>
+        replica(to) ! writeMsg(Some(to.longUid))
+      }
     case ReceiveTimeout =>
       reply(isTimeout = true)
   }
@@ -2273,8 +2360,8 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
   def props(key: KeyR,
             consistency: Replicator.ReadConsistency,
             req: Option[Any],
-            nodes: Set[Address],
-            unreachable: Set[Address],
+            nodes: Set[UniqueAddress],
+            unreachable: Set[UniqueAddress],
             localValue: Option[Replicator.Internal.DataEnvelope],
             replyTo: ActorRef): Props =
     Props(new ReadAggregator(key, consistency, req, nodes, unreachable, localValue, replyTo)).withDeploy(Deploy.local)
@@ -2287,8 +2374,8 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
 @InternalApi private[akka] class ReadAggregator(key: KeyR,
                                                 consistency: Replicator.ReadConsistency,
                                                 req: Option[Any],
-                                                override val nodes: Set[Address],
-                                                override val unreachable: Set[Address],
+                                                override val nodes: Set[UniqueAddress],
+                                                override val unreachable: Set[UniqueAddress],
                                                 localValue: Option[Replicator.Internal.DataEnvelope],
                                                 replyTo: ActorRef)
     extends ReadWriteAggregator {
@@ -2311,14 +2398,16 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
       throw new IllegalArgumentException("ReadLocal not supported by ReadAggregator")
   }
 
-  val readMsg = Read(key.id)
+  def readMsg(toSystemUid: Option[Long]) = Read(key.id, toSystemUid)
 
   private val (primaryNodes, secondaryNodes) = {
     primaryAndSecondaryNodes(requiresCausalDeliveryOfDeltas = false)
   }
 
   override def preStart(): Unit = {
-    primaryNodes.foreach { replica(_) ! readMsg }
+    primaryNodes.foreach { to =>
+      replica(to) ! readMsg(Some(to.longUid))
+    }
 
     if (remaining.size == doneWhenRemainingSize)
       reply(ok = true)
@@ -2338,7 +2427,9 @@ final class Replicator(settings: ReplicatorSettings) extends Actor with ActorLog
       if (remaining.size == doneWhenRemainingSize)
         reply(ok = true)
     case SendToSecondary =>
-      secondaryNodes.foreach { replica(_) ! readMsg }
+      secondaryNodes.foreach { to =>
+        replica(to) ! readMsg(Some(to.longUid))
+      }
     case ReceiveTimeout => reply(ok = false)
   }
 

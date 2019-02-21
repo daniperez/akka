@@ -155,6 +155,7 @@ class ReplicatorMessageSerializer(val system: ExtendedActorSystem)
   private val cacheTimeToLive = system.settings.config
     .getDuration("akka.cluster.distributed-data.serializer-cache-time-to-live", TimeUnit.MILLISECONDS)
     .millis
+  // FIXME probably no point in using these caches because of the new toSystemUid that is different for each msg
   private val readCache = new SmallCache[Read, Array[Byte]](4, cacheTimeToLive, m => readToProto(m).toByteArray)
   private val writeCache = new SmallCache[Write, Array[Byte]](4, cacheTimeToLive, m => writeToProto(m).toByteArray)
   system.scheduler.schedule(cacheTimeToLive, cacheTimeToLive / 2) {
@@ -263,40 +264,52 @@ class ReplicatorMessageSerializer(val system: ExtendedActorSystem)
   private def statusToProto(status: Status): dm.Status = {
     val b = dm.Status.newBuilder()
     b.setChunk(status.chunk).setTotChunks(status.totChunks)
-    val entries = status.digests.foreach {
+    status.digests.foreach {
       case (key, digest) =>
         b.addEntries(dm.Status.Entry.newBuilder().setKey(key).setDigest(ByteString.copyFrom(digest.toArray)))
     }
+    b.setToSystemUid(status.toSystemUid.get)
+    b.setFromSystemUid(status.fromSystemUid.get)
     b.build()
   }
 
   private def statusFromBinary(bytes: Array[Byte]): Status = {
     val status = dm.Status.parseFrom(bytes)
+    val toSystemUid = if (status.hasToSystemUid) Some(status.getToSystemUid) else None
+    val fromSystemUid = if (status.hasFromSystemUid) Some(status.getFromSystemUid) else None
     Status(status.getEntriesList.asScala.iterator.map(e => e.getKey -> AkkaByteString(e.getDigest.toByteArray())).toMap,
            status.getChunk,
-           status.getTotChunks)
+           status.getTotChunks,
+           toSystemUid,
+           fromSystemUid)
   }
 
   private def gossipToProto(gossip: Gossip): dm.Gossip = {
     val b = dm.Gossip.newBuilder().setSendBack(gossip.sendBack)
-    val entries = gossip.updatedData.foreach {
+    gossip.updatedData.foreach {
       case (key, data) =>
         b.addEntries(dm.Gossip.Entry.newBuilder().setKey(key).setEnvelope(dataEnvelopeToProto(data)))
     }
+    b.setToSystemUid(gossip.toSystemUid.get)
+    b.setFromSystemUid(gossip.fromSystemUid.get)
     b.build()
   }
 
   private def gossipFromBinary(bytes: Array[Byte]): Gossip = {
     val gossip = dm.Gossip.parseFrom(decompress(bytes))
+    val toSystemUid = if (gossip.hasToSystemUid) Some(gossip.getToSystemUid) else None
+    val fromSystemUid = if (gossip.hasFromSystemUid) Some(gossip.getFromSystemUid) else None
     Gossip(gossip.getEntriesList.asScala.iterator.map(e => e.getKey -> dataEnvelopeFromProto(e.getEnvelope)).toMap,
-           sendBack = gossip.getSendBack)
+           sendBack = gossip.getSendBack,
+           toSystemUid,
+           fromSystemUid)
   }
 
   private def deltaPropagationToProto(deltaPropagation: DeltaPropagation): dm.DeltaPropagation = {
     val b = dm.DeltaPropagation.newBuilder().setFromNode(uniqueAddressToProto(deltaPropagation.fromNode))
     if (deltaPropagation.reply)
       b.setReply(deltaPropagation.reply)
-    val entries = deltaPropagation.deltas.foreach {
+    deltaPropagation.deltas.foreach {
       case (key, Delta(data, fromSeqNr, toSeqNr)) =>
         val b2 = dm.DeltaPropagation.Entry
           .newBuilder()
@@ -307,19 +320,22 @@ class ReplicatorMessageSerializer(val system: ExtendedActorSystem)
           b2.setToSeqNr(toSeqNr)
         b.addEntries(b2)
     }
+    b.setToSystemUid(deltaPropagation.toSystemUid.get)
     b.build()
   }
 
   private def deltaPropagationFromBinary(bytes: Array[Byte]): DeltaPropagation = {
     val deltaPropagation = dm.DeltaPropagation.parseFrom(bytes)
     val reply = deltaPropagation.hasReply && deltaPropagation.getReply
+    val toSystemUid = if (deltaPropagation.hasToSystemUid) Some(deltaPropagation.getToSystemUid) else None
     DeltaPropagation(uniqueAddressFromProto(deltaPropagation.getFromNode),
                      reply,
                      deltaPropagation.getEntriesList.asScala.iterator.map { e =>
                        val fromSeqNr = e.getFromSeqNr
                        val toSeqNr = if (e.hasToSeqNr) e.getToSeqNr else fromSeqNr
                        e.getKey -> Delta(dataEnvelopeFromProto(e.getEnvelope), fromSeqNr, toSeqNr)
-                     }.toMap)
+                     }.toMap,
+                     toSystemUid)
   }
 
   private def getToProto(get: Get[_]): dm.Get = {
@@ -503,18 +519,27 @@ class ReplicatorMessageSerializer(val system: ExtendedActorSystem)
   }
 
   private def writeToProto(write: Write): dm.Write =
-    dm.Write.newBuilder().setKey(write.key).setEnvelope(dataEnvelopeToProto(write.envelope)).build()
+    dm.Write
+      .newBuilder()
+      .setKey(write.key)
+      .setEnvelope(dataEnvelopeToProto(write.envelope))
+      .setToSystemUid(write.toSystemUid.get)
+      .build()
 
   private def writeFromBinary(bytes: Array[Byte]): Write = {
     val write = dm.Write.parseFrom(bytes)
-    Write(write.getKey, dataEnvelopeFromProto(write.getEnvelope))
+    val toSystemUid = if (write.hasToSystemUid) Some(write.getToSystemUid) else None
+    Write(write.getKey, dataEnvelopeFromProto(write.getEnvelope), toSystemUid)
   }
 
   private def readToProto(read: Read): dm.Read =
-    dm.Read.newBuilder().setKey(read.key).build()
+    dm.Read.newBuilder().setKey(read.key).setToSystemUid(read.toSystemUid.get).build()
 
-  private def readFromBinary(bytes: Array[Byte]): Read =
-    Read(dm.Read.parseFrom(bytes).getKey)
+  private def readFromBinary(bytes: Array[Byte]): Read = {
+    val read = dm.Read.parseFrom(bytes)
+    val toSystemUid = if (read.hasToSystemUid) Some(read.getToSystemUid) else None
+    Read(read.getKey, toSystemUid)
+  }
 
   private def readResultToProto(readResult: ReadResult): dm.ReadResult = {
     val b = dm.ReadResult.newBuilder()
