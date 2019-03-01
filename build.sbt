@@ -50,34 +50,10 @@ lazy val aggregatedProjects: Seq[ProjectReference] = Seq(
   discovery
 )
 
-/** TODO add/fix remote, remoteTests coverage and include
-  * Does not include 
-  * - planned removals in 2.6 https://github.com/akka/akka/milestone/119
-  * - docs, protobuf, benchJmh
-  */
-lazy val aggregatedCoverage: Seq[ProjectReference] = Seq(
-  actor, actorTests, 
-  cluster, clusterMetrics, clusterSharding, clusterTools, contrib,
-  discovery, distributedData, persistence,
-  multiNodeTestkit,
-  slf4j, testkit)
-  /*multiNodeTestkit, osgi,
-  persistenceQuery, persistenceShared, persistenceTck,
-  stream, streamTestkit, streamTests, streamTestsTck,
-  
-  actorTyped, actorTypedTests, actorTestkitTyped,
-  persistenceTyped, clusterTyped, clusterShardingTyped,
-  streamTyped,*/
-  
-
-lazy val aggregated: Seq[ProjectReference] =
-  if (AkkaDisciplinePlugin.coverageJobEnabled) aggregatedCoverage
-  else aggregatedProjects
-
 lazy val root = Project(
   id = "akka",
   base = file(".")
-).aggregate(aggregated: _*)
+).aggregate(aggregatedProjects: _*)
  .settings(rootSettings: _*)
  .settings(unidocRootIgnoreProjects :=
    (CrossVersion.partialVersion(scalaVersion.value) match {
@@ -113,6 +89,7 @@ lazy val agent = akkaModule("akka-agent")
   .settings(Dependencies.agent)
   .settings(AutomaticModuleName.settings("akka.agent"))
   .settings(OSGi.agent)
+  .settings(AkkaDisciplinePlugin.coverageExclude)
   .enablePlugins(ScaladocNoVerificationOfDiagrams)
 
 lazy val akkaScalaNightly = akkaModule("akka-scala-nightly")
@@ -132,6 +109,7 @@ lazy val benchJmh = akkaModule("akka-bench-jmh")
     ).map(_ % "compile->compile;compile->test"): _*
   )
   .settings(Dependencies.benchJmh)
+  .settings(AkkaDisciplinePlugin.coverageExclude)
   .enablePlugins(JmhPlugin, ScaladocNoVerificationOfDiagrams, NoPublish, CopyrightHeader)
   .disablePlugins(MimaPlugin, WhiteSourcePlugin, ValidatePullRequest, CopyrightHeaderInPr)
 
@@ -140,6 +118,7 @@ lazy val camel = akkaModule("akka-camel")
   .settings(Dependencies.camel)
   .settings(AutomaticModuleName.settings("akka.camel"))
   .settings(OSGi.camel)
+  .settings(AkkaDisciplinePlugin.coverageExclude)
 
 lazy val cluster = akkaModule("akka-cluster")
   .dependsOn(remote, remoteTests % "test->test" , testkit % "test->test")
@@ -275,6 +254,7 @@ lazy val docs = akkaModule("akka-docs")
     AkkaParadoxPlugin, DeployRsync, NoPublish, ParadoxBrowse,
     ScaladocNoVerificationOfDiagrams,
     StreamOperatorsIndexGenerator)
+  .settings(AkkaDisciplinePlugin.coverageExclude)
   .settings(ParadoxSupport.paradoxWithCustomDirectives)
   .disablePlugins(MimaPlugin, WhiteSourcePlugin)
   .disablePlugins(ScalafixPlugin)
@@ -341,6 +321,7 @@ lazy val persistenceTck = akkaModule("akka-persistence-tck")
 lazy val protobuf = akkaModule("akka-protobuf")
   .settings(OSGi.protobuf)
   .settings(AutomaticModuleName.settings("akka.protobuf"))
+  .settings(AkkaDisciplinePlugin.coverageExclude)
   .enablePlugins(ScaladocNoVerificationOfDiagrams)
   .disablePlugins(MimaPlugin)
 
@@ -350,6 +331,7 @@ lazy val remote = akkaModule("akka-remote")
   .settings(AutomaticModuleName.settings("akka.remote"))
   .settings(OSGi.remote)
   .settings(Protobuf.settings)
+  .settings(AkkaDisciplinePlugin.coverageExclude)
   .settings(
     parallelExecution in Test := false
   )
@@ -358,6 +340,7 @@ lazy val remoteTests = akkaModule("akka-remote-tests")
   .dependsOn(actorTests % "test->test", remote % "test->test", streamTestkit % "test", multiNodeTestkit)
   .settings(Dependencies.remoteTests)
   .settings(Protobuf.settings)
+  .settings(AkkaDisciplinePlugin.coverageExclude)
   .settings(
     parallelExecution in Test := false
   )
